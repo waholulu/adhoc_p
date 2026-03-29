@@ -1,0 +1,588 @@
+我仔细过了一遍。结论先说：
+
+**这个计划的方向是对的，骨架也已经比一般“把 claims 直接喂给 LLM”成熟很多。**
+尤其是这几个点是明显正确的：
+
+* **T0 截断防泄漏**
+* **Claim-Block + 时间信号**
+* **长短期压缩**
+* **分层评估 long-tail**
+* **单卡 32GB 下默认 QLoRA**
+
+但如果按现在这版直接开工，我会说它是 **“70–80 分的研究计划，离稳定可落地版本还差几个关键补丁”**。下面我按“必须改 / 建议改 / 可以保留”来审。
+
+---
+
+# 一、我认为最需要补的 6 个关键问题
+
+## 1）目标定义还不够闭环：**30/60/90 multi-label 会有单调性问题**
+
+你现在写的是：
+
+* 输出：P(<30d), P(<60d), P(<90d)
+* Loss：Focal 或 BCEWithLogitsLoss
+
+这个设计**直觉上合理**，但有个很实际的问题：
+
+模型可能输出：
+
+* P(<30d)=0.41
+* P(<60d)=0.35
+* P(<90d)=0.62
+
+这在业务上是不合理的，因为理论上应该满足：
+
+**P(<30d) ≤ P(<60d) ≤ P(<90d)**
+
+### 建议
+
+你最好在计划里明确其中一种方案：
+
+**方案 A：继续 multi-label，但加单调约束**
+
+* 训练后做 monotonic projection / post-hoc calibration
+* 或在 loss 中加一个 consistency penalty：
+
+  * penalize `max(0, p30-p60)` 和 `max(0, p60-p90)`
+
+**方案 B：改成 ordinal / cumulative hazard 风格**
+
+* 例如输出：
+
+  * 30d 内
+  * 31–60d
+  * 61–90d
+  * > 90d
+* 再累加成 cumulative risk
+
+如果你最后是拿这个做**风险评分**而不是纯学术实验，我更建议你至少把**单调性约束**写进计划里，否则后面上线时一定会被问。
+
+---
+
+## 2）现在“训练目标”写得还不够明确：**你到底是做生成，还是做判别分类？**
+
+你这版计划里混了两种思路：
+
+一方面你在说：
+
+* Gemma 3 Base / Instruct
+* prompt engineering
+* sequence 输入给 LLM
+
+另一方面你又在说：
+
+* multi-label classification
+* focal loss / BCE
+* calibration
+
+这意味着一个关键实现细节还没落地：
+
+### 你到底要不要加一个 classification head？
+
+如果你只是让 causal LM 去“生成 3 个概率”，那：
+
+* 训练不稳定
+* 概率不干净
+* calibration 通常更差
+* inference 也更麻烦
+
+### 我建议
+
+**把它明确成“LLM encoder-like backbone + pooled hidden state + classification head”**，而不是生成式输出。
+
+更具体一点：
+
+* 输入仍然是 claims sequence
+* 取最后一个 token hidden state，或者做 attention pooling
+* 接一个小的 MLP / linear head
+* 输出 3 个 logits
+
+这样：
+
+* loss 更自然
+* calibration 更可控
+* 评估和部署也更标准
+
+**一句话：这个项目本质上是 risk classification，不是 instruction following。**
+所以如果要我押注，我会把 **Base + classification head** 当主线，**Instruct** 只做对照实验，不要把 Instruct 当默认主线。
+
+---
+
+## 3）最大缺口之一：**没有明确 max sequence length 和 overflow 策略**
+
+这是目前计划里最危险的工程缺口之一。
+
+你写了：
+
+* 平均 200 claims，少数 >1000
+* 单卡 32GB
+* QLoRA
+* bucketing
+* recent-detailed, distant-coarse
+
+但你**没有明确最终训练时的 max_seq_len**。
+
+这会导致整个计划虽然“看起来可控”，实际上很容易在实现时才发现：
+
+* 8k 根本跑不稳
+* 4k 才能稳定
+* 或 16k 虽然能 forward，但 batch/throughput 完全不可接受
+
+### 建议你必须补上
+
+在计划里写清楚：
+
+**Stage 1 默认 max_seq_len = 4k 或 8k**
+
+* 不要一开始追求超长上下文
+* 先验证建模有效性
+
+然后写清 overflow 规则：
+
+**当 sequence 超过 max length 时，按固定策略裁剪：**
+
+1. 先保留最近 6 个月 full detail
+2. 再保留 6–24 个月压缩块
+3. 超过预算的更远历史再 summary 化
+4. 最终仍超预算时，优先保留：
+
+   * 近期 inpatient/ER
+   * chronic high-risk DX
+   * 高权重 PROC
+   * ongoing / overlap blocks
+
+没有这个，后面 sequence builder 会变成“尽量塞”，最后 token budget 会失控。
+
+---
+
+## 4）词表方案还差一个核心落地点：**新增 token 的 embedding 怎么训练？**
+
+你已经意识到 “add all codes to tokenizer” 会爆炸，这很好。
+
+但现在还有个更关键的问题：
+如果你新增了大量 code tokens，即便只有 Top 30k，你也必须解决：
+
+### 这些新 token embedding 是否真的会被训练到？
+
+因为在 LoRA 方案里，通常：
+
+* attention / MLP 权重走 LoRA
+* 但 **embedding matrix 默认可能是冻结的**
+* 如果 embedding 不训，新加 code token 可能长期是半随机状态
+
+这会直接让 “1 code ≈ 1 token” 的收益大幅下降。
+
+### 所以这里要补一句非常关键的话
+
+你需要在计划里明确：
+
+**新增 code tokens 时，embedding 层必须显式纳入可训练范围**
+至少要定义其中一种方案：
+
+* 训练 `embed_tokens`（哪怕只训练新增行）
+* 或用 `modules_to_save` 方式保存 embedding
+* 或大幅减少新增 full-code token 数量，更多依赖 category token
+
+### 我给你的现实建议
+
+在 **1×32GB GPU** 的前提下，我不会一开始就上 **Top 30k full code tokens**。
+我会更保守一些：
+
+* POS：全量单 token
+* REV：压缩后单 token
+* DX / PROC：先上 **高频 5k–10k full token**
+* 剩下先走 category / prefix mapping
+
+因为你现在最大的敌人不是“表达力不够”，而是**embedding 学不稳 + 训练资源不够 + pipeline 复杂度太高**。
+
+---
+
+## 5）Claim-Block 虽然可行，但你还没回答一个本质问题：**claim 是不是合适的原子单位？**
+
+这是我觉得这份计划里**最值得你再想一层**的点。
+
+你现在定的是：
+
+* Claim-Block as atomic event
+
+这在 billing 数据上当然容易做，但 claims 世界里一个很大的问题是：
+
+**claim 往往是 billing artifact，不一定等于 clinical event。**
+
+举例：
+
+* 同一次住院，可能拆成多条 claim / 多条 line
+* 同一天多个专业收费
+* 同一 encounter 被多个 billing entity 分裂
+
+结果就是：
+
+* token 很多
+* 重复很多
+* overlap 很多
+* 噪声很多
+
+### 所以我建议你在计划里明确一句
+
+**Claim-Block 是 V1 的默认实现，但如果数据允许，应优先尝试 episode / encounter aggregation。**
+
+也就是：
+
+* 同一 service window
+* 同一 inpatient stay
+* 同一 ED encounter
+* 同日/相近日期同机构相关 claim
+
+先聚成 **Encounter-Block / Episode-Block**，再喂模型。
+
+这会带来两个巨大收益：
+
+1. **更贴近 readmission 的临床语义**
+2. **大幅降低 token 冗余**
+
+如果你短期内做不到，也没关系，但建议你至少把它写成一个明确的 ablation：
+
+* Claim-Block vs Encounter-Block
+
+我甚至认为这比 “Base vs Instruct” 更值得测。
+
+---
+
+## 6）评估设计还差最关键的一条：**split 必须按 patient，并最好带时间外推**
+
+你现在写了 stratified evaluation，这很好。
+但你还没明确数据划分方式。
+
+对这类任务，如果 split 不严格，很容易出问题：
+
+* 同一个 patient 的不同样本进入 train/test
+* 模型记住 patient pattern
+* 指标虚高
+
+### 必须补充
+
+至少写清：
+
+**数据划分按 patient-level split**
+
+* 同一患者不能同时出现在 train/val/test
+
+如果你要更严谨，最好再加：
+
+**再做一个 temporal split / pseudo-prospective validation**
+
+* 例如较早时间训练，较晚时间验证/测试
+
+因为 readmission risk 这种任务很容易受：
+
+* coding drift
+* benefit design change
+* provider behavior change
+* population shift
+
+影响。
+如果你只做随机 split，实验好看，但上线效果不一定真好。
+
+---
+
+# 二、几个“方向对，但还需要修正表述”的地方
+
+## 1）Focal Loss 不要写成“strongly recommend”
+
+这个我会收一收。
+
+Focal Loss 的优点：
+
+* 对极度稀疏正类确实有帮助
+* 能拉高难样本关注度
+
+但缺点也非常明显：
+
+* **校准通常更差**
+* 对概率输出不够友好
+* 超参敏感
+* 在 healthcare risk scoring 里，未必比加权 BCE 更稳
+
+### 更稳妥的写法
+
+把它改成：
+
+* **Baseline：BCEWithLogitsLoss + pos_weight**
+* **Ablation：Focal Loss**
+
+这更像严谨方案，而不是先入为主。
+
+---
+
+## 2）“time tokens 放 block 开头”这个解释可以保留，但别说得太绝对
+
+你写的 reasoning 是：
+
+> 放在 block 头部更利于 attention 机制把时间先验注入后续 DX/PROC token
+
+这个逻辑没问题，但**不要写成太强结论**，因为这是经验性设计，不是铁律。
+
+### 更稳一点
+
+写成：
+
+* 默认将 `<REC/GAP/DUR>` 放在 block 头部，作为该 claim 的时间先验
+* 后续做少量 ablation，比较 head-placement vs tail-placement / interleaving
+
+这样会更科学。
+
+---
+
+## 3）Top-K 截断规则需要防止“特征筛选泄漏”
+
+你建议：
+
+* 用 univariate lift / mutual info 预排序
+
+这本身没问题，但必须加一句：
+
+**所有基于标签的排序统计必须只在 training split 上计算。**
+
+否则会产生特征选择泄漏。
+
+另外，我还建议你不要只依赖全局相关性排序。因为那会倾向保留：
+
+* 高频
+* 平均有效
+
+却可能丢掉：
+
+* 低频但高风险的 code
+
+### 更稳的做法
+
+按多级优先级排序：
+
+1. 明确高风险 code list / chronic list / inpatient / ER 相关
+2. 再按 training-only 统计重要性
+3. 再按频率
+
+---
+
+## 4）“Demographic discretize to avoid leakage” 这个说法不准确
+
+离散化的主要作用不是“避免 leakage”，而是：
+
+* 降低稀疏性
+* 降低模型对连续值 scale 的不稳定依赖
+* 便于 token 化
+
+像年龄、Zip3 这些本身不是泄漏。
+真正的风险是：
+
+* 过细粒度地址 / provider / facility ID 带来隐式 memorization
+* 公平性 / 合规问题
+
+### 所以表述建议改成
+
+* demographic features should be discretized for sparsity control and more stable tokenization
+* fine-grained location/provider identifiers require fairness and memorization review
+
+---
+
+## 5）“unused token 复用”要非常谨慎，不要写成推荐默认方案
+
+这个点我会特别保守。
+
+原因是：
+
+* 不同 tokenizer 是否真有大量安全可复用 token，不一定
+* 复用保留 token 可能带来意料外副作用
+* 后续维护性也差
+
+### 更稳的建议
+
+你可以写：
+
+* 优先最小化新增 special tokens 数量
+* 对 code vocabulary 采用严格裁剪
+* 是否复用 reserved/unused tokens，必须先在实际 tokenizer 文件中验证后再决定，不作为默认前提
+
+---
+
+# 三、这份计划里还缺少的“医疗 claims 特有清洗规则”
+
+这是我觉得你团队真正开干时最可能踩坑的部分。现在计划偏模型，数据治理还不够细。
+
+## 1）没有写 claim versioning / adjustment / void / reversal 逻辑
+
+真实 claims 数据很常见：
+
+* 调整单
+* 冲销单
+* replacement claims
+* denied / reversed claims
+
+如果不先清洗：
+
+* 同一事件可能重复出现
+* duration / overlap / gap 都会失真
+* label 也可能被污染
+
+### 必须补
+
+在 Step 1 数据清洗里加上：
+
+* final adjudicated claim only / paid claim logic
+* void/replacement 处理
+* duplicate line collapse
+
+---
+
+## 2）没有明确 ICD-9 / ICD-10 / CPT / HCPCS / REV / POS 的版本归一
+
+这个也要写。
+
+尤其是 DX / PROC：
+
+* 版本不同，不能简单混成一个 vocab
+* 同码不同体系可能语义不同
+
+### 建议
+
+token 明确 namespace，例如：
+
+* `<DX10_E119>`
+* `<DX9_25000>`
+* `<CPT_99213>`
+* `<HCPCS_G0463>`
+* `<REV_0450>`
+* `<POS_23>`
+
+不要只靠 `<DX>` `<PROC>` 这种 field tag 去 disambiguate，
+**code token 自身最好也带体系前缀。**
+
+---
+
+## 3）如果任务是 readmission，必须明确“index event”的构造
+
+现在计划里只写了 T0，但还没把样本定义说透。
+
+你需要明确：
+
+* 样本是否以 discharge 为 anchor
+* 是否只对 index inpatient discharge 建样本
+* 30/60/90 天 readmission label 具体定义
+* observation stay 算不算
+* planned readmission 是否排除
+* 同一患者多次 discharge 是否产生多样本
+* 样本间窗口是否允许重叠
+
+这些不写清楚，模型设计再漂亮，结果也很难解释。
+
+---
+
+# 四、我觉得应该新增的 4 个实验，不然你后面很难知道哪一步真有用
+
+你现在的 ablation 有一些，但还不够“抓主要矛盾”。
+
+## 我建议新增这四个
+
+### 1）Claim-Block vs Encounter/Episode-Block
+
+这是高优先级。
+
+### 2）Full-code token vs category/prefix-heavy tokenization
+
+这能直接回答：
+
+* 词表扩张到底值不值
+* 单卡训练下 full-code 表达是否划算
+
+### 3）With vs without trainable embeddings for new tokens
+
+这是验证你词表方案是否真的工作起来的核心实验。
+
+### 4）LLM sequence model vs strong tabular baseline
+
+这个非常重要。
+你一定要有一个硬基线，比如：
+
+* XGBoost / LightGBM on engineered features
+* 或现有 RAP baseline
+
+否则就算 LLM AUPRC 看起来不错，你也不知道它是不是只是“复杂地做了同样的事”。
+
+---
+
+# 五、我会怎么改这份计划的优先级
+
+如果你问我“按单卡32GB、最小投入、最大成功率”怎么排，我会这么改：
+
+## 第一阶段主线
+
+* **Base model**
+* **classification head**
+* **BCE + pos_weight**
+* **max_seq_len 先保守**
+* **高频少量 full-code token + 其余 category mapping**
+* **Claim-Block 先做起来**
+* **patient-level split + stratified report**
+
+## 第二阶段再做
+
+* Focal loss
+* Instruct 对照
+* smart init
+* 更大 vocab
+* 更长上下文
+* episode aggregation
+
+换句话说，这份计划里有些增强项写得太早了，容易把项目复杂度拉高。
+
+---
+
+# 六、我给这份计划的总评
+
+## 优点
+
+这份计划最强的地方是：
+
+* 已经不再是“把 claims 原样喂模型”
+* 对泄漏、长序列、long-tail、token budget 都有意识
+* 已经具备研究型方案的框架完整度
+
+## 主要风险
+
+真正会让项目失败的不是大方向，而是这几个实施细节：
+
+1. **没有明确判别式 head**
+2. **没有明确 max length / overflow policy**
+3. **新增 token embedding 训练问题没落地**
+4. **claim 粒度可能过碎**
+5. **label/split/cohort 定义还不够严**
+6. **focal 被写得过于前置**
+
+## 我的评分
+
+如果按“研究计划质量”打分，我会给：
+**8/10**
+
+如果按“明天交给工程团队直接开工的可执行度”打分，我会给：
+**6.5–7/10**
+
+不是因为方向不行，而是因为还有几个地方一旦没补齐，后面会在实现阶段反复返工。
+
+---
+
+# 七、最值得你立刻改进的版本摘要
+
+如果你想把这份计划快速改成更稳的版本，我建议立刻加入下面这几条：
+
+1. **明确主线是判别式分类，不是生成式输出**
+2. **明确 max_seq_len 和 overflow 裁剪规则**
+3. **明确新增 token embedding 必须可训练**
+4. **multi-label 加单调性约束**
+5. **split 必须 patient-level，最好再加时间外推验证**
+6. **claims 数据清洗加入 adjusted/void/reversal/versioning**
+7. **把 Focal Loss 从默认主线降为 ablation**
+8. **把 Claim-Block vs Encounter-Block 加入核心对照实验**
+
+---
+
+如果你愿意，我下一步可以直接帮你把这份计划**改写成一个“更适合真正开工”的 v2 版本**，我会把上面这些问题直接嵌进去，变成可以发给团队的正式版。
