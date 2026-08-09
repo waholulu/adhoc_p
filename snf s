@@ -1,0 +1,539 @@
+对，你现在遇到的这个问题非常关键。我重新把几篇核心研究的 cohort construction 专门拆了一遍以后，结论比我上一轮说得更明确：
+
+大多数全国 Medicare claims 研究其实并没有真正识别 “SNF intent population”。
+真正做到“这些人原本是 SNF candidate，但其中一部分被 redirect home”的，主要是 RaH/HIHR 这类 intervention studies。
+
+而你现在用 discharge status code 03 → 再看后面谁用了 HHS，从定义上确实容易走歪。
+
+CMS 对 03 的定义就是实际 discharge/transfer 到 Medicare-certified SNF；06 才是 discharge to home under an organized home health service。也就是说，03 不是 “SNF recommended / SNF intended”，而是最终 disposition。
+
+所以：
+
+03 + 后续 HHS
+
+很容易得到
+Hospital → SNF → Home + HHS
+
+而不是你真正想要的：
+
+Hospital → 原本计划 SNF → 改成 Home + HHS
+
+这两个 population 完全不是一回事。
+
+⸻
+
+1. Werner 2019 其实没有构造 “SNF intent cohort”
+
+这篇最重要，因为它很容易让人误以为他们找的是 “SNF-eligible patients”。
+
+实际上他们的 cohort 是：
+
+所有住院后实际 discharge 到 SNF，或者实际 discharge home 并接受 HHA care 的患者。
+
+然后排除：
+
+* <66 岁；
+* 住院前 30 天已经住 nursing home；
+* index hospitalization <3 days，因为当时传统 Medicare SNF coverage 通常需要 qualifying 3-day hospitalization；
+* hospice。
+
+也就是说，他们实际上先定义：
+
+Formal PAC users = SNF ∪ Home Health
+
+然后比较两个 actual destination。
+
+他们没有要求 HH group 曾经有 SNF referral/recommendation。
+
+更重要的是，我查他们的方法，没有看到他们把 prior HHA users 系统排除掉。这意味着你发现的这种现象——有些 HH patients 原本就是 HH users——在这种 national claims design 中本来就可能存在。
+
+他们真正解决 “两个 group fundamentally different” 的办法，不是 cohort definition，而是：
+
+instrumental variable：differential distance to nearest HHA vs SNF。
+
+它利用患者住处距离哪一种 PAC provider 更近，来识别那些因为 geographic convenience 而改变 treatment choice 的 marginal patients / compliers。
+
+所以 Werner 2019 的：
+
+“eligible for HH or SNF”
+
+更准确理解应该是：
+
+statistically inferred marginal population
+
+而不是：
+
+hospital documentation says SNF was intended.
+
+这是两个完全不同的概念。
+
+⸻
+
+2. Dementia 那篇 Burke 2022 也是同一个套路
+
+它基本复刻 Werner：
+
+Hospital → SNF
+
+vs
+
+Hospital → HH
+
+实际 PAC destination。
+
+他们排除了：
+
+* <65；
+* 从 nursing home 入院；
+* hospice；
+
+然后用 differential distance IV 处理 SNF vs HH selection。
+
+所以它同样不是 true SNF-intent cohort。
+
+这两类 paper 可以回答：
+
+在现实中位于 SNF/HH decision margin 的患者，setting 改变会怎样？
+
+但不能直接回答：
+
+“医院本来想送 SNF、后来主动 aversion 的患者会怎样？”
+
+⸻
+
+3. 真正最接近你想做的，是 Augustine 的 RaH
+
+这就完全不一样了。
+
+2020 年 Augustine 的 Rehabilitation-at-Home intervention 明确要求：
+
+患者必须 qualify for SNF-based rehabilitation services。
+
+也就是说，他们不是：
+
+所有 HH users
+
+而是：
+
+先证明这个患者有 SNF-level rehabilitation need → 再允许其中一些人在家接受替代服务。 
+
+所以这才是真正意义上的：
+
+SNF-substitution cohort
+
+而不是 generic HH cohort。
+
+⸻
+
+4. 他们 2023 年进一步做得更漂亮
+
+Augustine 2023 比较：
+
+RaH patients
+
+vs
+
+same geographic area 的 5,535 SNF patients
+
+RaH patient 本身首先必须：
+
+满足 SNF subacute care / rehabilitation qualification。
+
+然后 SNF control group 也尽量套用相同 inclusion/exclusion criteria。
+
+他们还排掉：
+
+* hospital discharge 后没有及时进入 SNF 的；
+* clinical need 高到本来就不符合 RaH eligibility 的 SNF patients。
+
+之后才 propensity matching。
+
+这个设计跟 Werner 最大的差别是：
+
+Werner：
+
+Actual HH vs actual SNF → statistical method 找 marginal patients
+
+Augustine：
+
+先确定 “这人达到 SNF-level need” → 再比较 SNF vs home substitute
+
+对于你的目的，我明显更喜欢第二种。
+
+⸻
+
+5. Cleveland Clinic 2025 又给出了第三种非常实用的方法
+
+这个 HIHR study 对你特别有借鉴意义。
+
+他们没有依赖 discharge code 来定义 SNF intent，而是直接建立一个 clinical eligibility window：
+
+患者必须同时满足：
+
+* traditional Medicare / ACO attribution；
+* 预测 30-day readmission risk <35%；
+* AM-PAC mobility raw score 16–22；
+* clinical team 判断 home-based care appropriate。
+
+AM-PAC 16–22 这个设计非常聪明：
+
+功能已经差到需要 rehabilitation，
+但又没有差到 home discharge 明显不安全。
+
+这其实就是人为定义了：
+
+SNF/HH clinical equipoise population
+
+然后，他们从 35,990 个实际 SNF discharges 中，把不满足 HIHR eligibility criteria 的全部排掉。
+
+最后只剩：
+
+841 个“如果 HIHR 当时可用，其实理论上也符合 HIHR criteria”的 SNF patients。
+
+再跟 171 HIHR patients 比较。
+
+这其实非常接近你现在应该做的事情。
+
+⸻
+
+所以你的问题其实不是“怎么找 code”
+
+而是应该把 cohort 定义拆成两层：
+
+Layer 1：谁有 “SNF-level post-acute need”？
+
+然后：
+
+Layer 2：这些人中，谁实际去了 SNF，谁实际去了 home + HH？
+
+而不是倒过来用：
+
+discharge code 03
+
+来定义 Layer 1。
+
+03 已经是 Layer 2 的 treatment assignment 了。
+
+⸻
+
+对你现在的数据，我会这样重做
+
+特别是你已经观察到：
+
+home-health group 里面很多人在 index admission 之前就一直用 HH。
+
+这个实际上说明你现在把两种不同类型 HHS 混起来了。
+
+最近 Medicare literature 也明确区分：
+
+post-discharge home health
+
+和
+
+community-initiated home health
+
+后者经常是为了 chronic disease / ongoing functional decline，本质上不是 post-acute substitute。
+
+所以我建议你的 cohort 先这样切。
+
+Step 1：Index acute hospitalization
+
+从所有 acute IP discharge 开始。
+
+不要先限定 disposition=03。
+
+⸻
+
+Step 2：排掉明显不是 “new post-acute episode” 的人
+
+我会至少做一个：
+
+60 或 90 天 lookback
+
+排除/单独标记：
+
+* active SNF stay
+* long-term nursing home
+* active HHS episode
+
+尤其：
+
+index hospitalization 前已经持续接受 HHS 的患者，不应该直接进入你的 primary HHS comparator。
+
+因为你研究的是：
+
+SNF → HHS substitution
+
+不是：
+
+本来就在接受 HHS 的人 hospital 后继续 HHS。
+
+这两个 causal pathway 完全不一样。
+
+我甚至会做 sensitivity analysis：
+
+30-day washout / 60-day washout / 90-day washout
+
+看结论稳定不稳定。
+
+⸻
+
+Step 3：重新定义 “new PAC treatment”
+
+例如 index hospital discharge 后：
+
+0–3 days / 0–7 days
+
+寻找：
+
+* first SNF admission
+* first new HHS episode
+
+然后定义 mutually exclusive treatment：
+
+SNF group
+
+Hospital → SNF
+
+HH group
+
+Hospital → Home → NEW HH
+
+而：
+
+Hospital → SNF → HH
+
+仍然必须算 SNF treatment。
+
+后面的 HH 是 downstream care，不是 treatment assignment。
+
+这是你目前最可能出问题的地方。
+
+⸻
+
+Step 4：真正困难的地方——怎么找 SNF-intent？
+
+这里我会按你数据丰富程度分三个等级。
+
+最优：如果你有 UM / authorization / EHR / discharge planning 数据
+
+这个最好。
+
+找：
+
+* SNF authorization request
+* SNF referral
+* SNF pre-certification
+* care manager SNF recommendation
+* PT/OT discharge recommendation = SNF
+* case management placement request
+* SNF facility search / referral sent
+* authorization denied / withdrawn / changed to HH
+
+然后定义：
+
+SNF-intent = 在最终 discharge decision 之前曾经有 documented SNF referral/recommendation/authorization request。
+
+这样你就能得到非常漂亮的：
+
+SNF intended
+→ actually SNF
+
+versus
+
+SNF intended
+→ diverted to home + HH
+
+这才是真正的 SNF Aversion population。
+
+而医院 discharge planning 本身确实高度依赖 functional status、PT/OT recommendation、medical complexity、home/caregiver support 等，而不是一个单独 claims discharge code。
+
+如果你的公司数据里能拿到 authorization history，我会把这个放在所有其他方法之前。
+
+⸻
+
+第二优：没有 intent 数据，但有 clinical/EHR feature
+
+那我会学 Cleveland Clinic：
+
+人为构造一个：
+
+“SNF-or-Home eligible window”
+
+例如：
+
+* moderate ADL impairment
+* moderate mobility impairment
+* 有 PT/OT need
+* 不需要 24h high-intensity skilled nursing
+* no mechanical ventilation
+* no unstable IV / complex wound 等明显 SNF-only needs
+* readmission risk 不过高
+* home environment / caregiver feasible
+
+然后：
+
+只在这个 clinical equipoise cohort 内比较 SNF vs HH。
+
+这比 code 03 好非常多。
+
+⸻
+
+第三优：只有 claims
+
+如果你只有 claims，我会采用一种更 data-science 的方案。
+
+先拿所有：
+
+new SNF + new post-acute HH
+
+建立一个模型：
+
+P(SNF \mid X)
+
+其中 X 只能用 index discharge 之前能知道的变量：
+
+* age
+* sex
+* DRG
+* diagnosis
+* surgery
+* LOS
+* ICU
+* prior IP
+* prior ED
+* comorbidity
+* frailty proxy
+* DME
+* prior PT/OT
+* prior SNF
+* prior HH
+* home/community characteristics
+* etc.
+
+然后看 propensity distribution。
+
+你真正关心的不是：
+
+P(SNF)=0.02 的 HH patient
+
+这种人本来就几乎不可能去 SNF。
+
+而是：
+
+SNF-likely / overlap population
+
+例如：
+
+P(SNF)=0.3–0.7
+
+或者更针对 aversion：
+
+predicted SNF probability 高，但 actually home + HH
+
+这部分人才是你在 claims 中能逼近的：
+
+latent SNF-intent / marginal SNF population
+
+Werner 的 IV 本质上也是在试图识别这种 marginal patients，只是方法不是 prediction，而是 differential distance。
+
+⸻
+
+我会特别推荐你做一个 cohort waterfall
+
+最终类似这样：
+
+All acute inpatient discharges
+
+↓
+
+排除 hospice / death / AMA / IRF / LTCH
+
+↓
+
+排除 prior nursing-home residents
+
+↓
+
+排除 active / chronic HH users
+或者至少单独分层
+
+↓
+
+要求 index admission 后产生 new formal PAC episode
+
+↓
+
+New SNF vs New HH
+
+↓
+
+用 clinical eligibility / predicted SNF propensity
+找到：
+
+SNF-appropriate / SNF-marginal cohort
+
+↓
+
+最终：
+
+Actual SNF
+
+vs
+
+SNF-like but Home + HH
+
+↓
+
+比较：
+
+30d readmission
+90d readmission
+ED
+mortality
+subsequent SNF rescue
+cost
+
+⸻
+
+其中我觉得你现在最应该先改的一点
+
+不是换 discharge code。
+
+而是先把 HH episode classification 做对：
+
+Pre-existing / community-initiated HH
+
+vs
+
+new post-acute HH following the index hospitalization
+
+这是你现在结果看起来奇怪的核心原因之一。
+
+如果一个人在住院前 3 个月每周就已经有 HH claims：
+
+Hospital → HH
+
+不能被解释成：
+
+“医院本来可以送 SNF，但把他降级成 HH。”
+
+更可能只是：
+
+“他回到了原来的 home-care pathway。”
+
+这种 patient 放进 treatment group 会严重改变你估计的 treatment effect。
+
+⸻
+
+所以如果让我替你定 primary cohort
+
+我现在会优先定义成：
+
+Community-dwelling patients hospitalized from home, with no active SNF/nursing-home stay and no active HHS episode in the prior 60–90 days, who after index discharge initiate either a new SNF episode or a new HHS episode, and whose pre-discharge characteristics place them within the empirical SNF–HHS treatment-overlap region.
+
+如果还能拿到 authorization/referral data，则进一步变成：
+
+patients with documented SNF referral / authorization intent who ultimately either enter SNF or are diverted to home-based care。
+
+后面这个版本会比单纯 claims propensity cohort 强一个档次，而且最贴合“SNF aversion”的业务问题。
