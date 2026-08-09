@@ -1,0 +1,750 @@
+ # 保险 Claims 30 天再入院模型：结果复核与路线调整报告
+
+## 一、执行摘要
+
+你当前的实验结果是合理的，而且比外部论文或模型规模更值得相信：
+
+- Gemma 3 1B + LoRA；
+- 从头训练的小型 Transformer；
+- mean pooling：平均 code embedding + 11 个患者汇总变量；
+
+在约 30 万训练样本上，三者表现接近，但 mean pool 的训练成本低得多。
+
+这并不能证明“Transformer 对 claims 无效”，但强烈提示：
+
+1. 当前预测信号可能主要来自疾病构成、既往利用率、患者年龄及近期住院状态；
+2. 这些信号大部分可以由“无序 code 集合 + 汇总变量”表达；
+3. claims 中的精确 code 顺序可能噪声很大；
+4. Gemma 的自然语言预训练与原始 claims 编码并不匹配；
+5. 小 Transformer 在 30 万患者上仍未获得足够数据去学习稀疏的高阶时序交互；
+6. 复杂模型真正可以利用的增量信息，可能远小于此前预期。
+
+因此，我会修正此前的模型推荐：
+
+> 当前生产主线不应默认从大型预训练模型开始，而应以强化版 mean pooling/DeepSets 为主模型，以预训练模型作为 challenger。
+
+ReClaim-L/M 仍然是理论上最有希望超过 mean pool 的模型，因为它是 claims-native 预训练；但即使能拿到，也必须证明它在相同输入、相同汇总特征、相同测试集上有足够的增量价值。
+
+---
+
+# 二、目前能得出什么，不能得出什么
+
+## 可以初步得出的结论
+
+mean pool 已经是一个很强的 claims baseline，而不是“过度简单”的模型。
+
+你的任务很可能接近：
+
+\[
+P(Y=1)=f(\text{疾病组成},\text{治疗组成},\text{近期利用率},\text{人口属性})
+\]
+
+而不是高度依赖：
+
+\[
+P(Y=1)=f(\text{每个 code 的精确先后顺序和复杂长程交互})
+\]
+
+对于 30 天再入院，患者最近住院、既往住院次数、疾病负担、药物和操作构成，通常都可以通过聚合表示得到。
+
+## 目前还不能得出的结论
+
+还不能直接断言：
+
+- mean pool 在全量 150 万样本上仍然等同于 Transformer；
+- 序列信息完全没有价值；
+- 预训练 claims foundation model 不会有效；
+- Gemma 的失败代表所有大模型都会失败。
+
+在下结论前，至少需要确认：
+
+- 三个模型是否使用了完全相同的信息；
+- 11 个汇总变量是否也提供给 Gemma 和小 Transformer；
+- 是否存在患者或时间泄漏；
+- “表现接近”具体是 AUROC 接近，还是 AUPRC、校准、top-k recall 都接近；
+- 神经网络是否经过足够调参和多个随机种子；
+- 复杂模型的 learning curve 是否仍在上升。
+
+---
+
+# 三、为什么 mean pooling 会很强
+
+## 1. 它本质上是一个正则化很强的加性风险模型
+
+假设每个 code \(c_i\) 有 embedding \(e(c_i)\)：
+
+\[
+z=\frac{1}{N}\sum_{i=1}^{N}e(c_i)
+\]
+
+如果后面接线性分类头：
+
+\[
+\text{logit}(p)=w^\top z+\beta^\top s
+\]
+
+其中 \(s\) 是 11 个汇总变量，那么：
+
+\[
+\text{logit}(p)=\frac{1}{N}\sum_i w^\top e(c_i)+\beta^\top s
+\]
+
+可以理解为：
+
+- 每个 code 贡献一个风险分数；
+- mean pooling 汇总疾病、操作和药物组成；
+- 11 个变量补充年龄、性别、利用率、住院历史和近期性。
+
+许多再入院风险确实近似于多个风险因素的叠加。模型不一定需要复杂 attention 才能学到这些规律。
+
+如果 pooling 后接的是 MLP，它还可以进一步学习 code 组成与汇总变量之间的非线性交互。
+
+## 2. Mean pool 与 11 个变量形成了很好的互补
+
+Mean pooling 通常会丢失“数量”信息：
+
+- 一个患者有 5 个 codes；
+- 另一个患者有 100 个 codes；
+
+如果 code 组成类似，两者的均值可能相近。
+
+但你的 11 个汇总变量很可能已经补充了：
+
+- 住院次数；
+- 最近住院间隔；
+- utilization；
+- 年龄；
+- 其他疾病或服务强度指标。
+
+于是：
+
+- mean pool 回答“发生过什么”；
+- 汇总变量回答“发生了多少、多久以前、患者基础风险如何”。
+
+这种组合天然很强。
+
+## 3. Claims 更像 noisy set，而不一定像自然语言序列
+
+自然语言的词序通常有确定语义，但 claims 的顺序可能来自：
+
+- claim line 排列；
+- 同日不同账单的提交顺序；
+- adjudication 顺序；
+- 一个 encounter 被拆成多个 records；
+- 同一 code 的重复账单；
+- 不同 provider 的提交时间差异。
+
+如果模型把这些当成真实的临床顺序，Transformer 可能在学习噪声。
+
+Mean pooling 则对排列不敏感，正好规避了这一问题。
+
+## 4. 30 万患者足够学习一阶风险，但未必足够学习高阶组合
+
+对于 mean pool，模型主要需要学习：
+
+- 心衰 code 是否增加风险；
+- CKD、COPD、感染等疾病是否增加风险；
+- 某类住院或操作是否增加风险。
+
+常见 code 在 30 万样本中已经出现很多次。
+
+但 Transformer 还需要学习：
+
+- code A 后 15 天出现 code B；
+- procedure C 与 medication D 的组合；
+- 某个长尾 code 在特定时间条件下的作用；
+- 多次 visits 之间的轨迹。
+
+这些组合的有效样本数量远小于患者总数。30 万患者并不等于有 30 万个每种序列模式。
+
+## 5. 简单模型的优化更容易
+
+Mean pool 通常具有：
+
+- 更大的 batch；
+- 更稳定的梯度；
+- 更少的参数；
+- 更低的随机种子方差；
+- 更少的截断；
+- 更容易完成充分的超参数搜索。
+
+复杂模型理论容量更高，但在固定 T4 和训练时间下，未必真正训练到最佳状态。
+
+---
+
+# 四、为什么 Gemma 3 1B LoRA 没有体现规模优势
+
+Gemma 的 1B 参数主要来自自然语言预训练，而不是保险 claims 预训练。
+
+## 1. Tokenization 不匹配
+
+原始 codes 例如：
+
+- `I50.23`
+- `99223`
+- `93306`
+- NDC 编码
+
+可能被 Gemma 拆分成多个字符或 subtoken。这些 token 在预训练中没有稳定的 claims 语义。
+
+因此：
+
+> 模型有预训练权重，不等于模型预训练过你的输入空间。
+
+如果输入只有 raw codes，Gemma 的大部分医学或语言知识很难被激活。
+
+## 2. Decoder-only 架构并非患者分类的最自然选择
+
+Gemma 是 causal decoder。你的任务则需要：
+
+- 汇总整个患者历史；
+- 生成一个稳定 patient embedding；
+- 输出一个二分类概率。
+
+双向 encoder、DeepSets 或分层 visit encoder 往往更直接。使用 decoder LLM 做分类，需要额外处理：
+
+- 使用哪个 token 表示全局；
+- pooling 方法；
+- 长序列截断；
+- causal attention 对前后文可见性的限制。
+
+## 3. LoRA 的适配能力有限
+
+LoRA 主要对部分权重做低秩更新。如果基础模型从未学过 claims code 语义，仅靠 LoRA 未必能完成：
+
+\[
+\text{通用语言模型}\rightarrow\text{claims trajectory encoder}
+\]
+
+特别是在 code embeddings、位置结构、事件类型和时间表示都不匹配时。
+
+## 4. T4 约束可能造成不公平的有效容量比较
+
+Gemma 在 T4 上可能需要：
+
+- 较短 context；
+- 较小 batch；
+- gradient accumulation；
+- 量化；
+- 更少 LoRA target modules；
+- 更少超参数实验。
+
+因此，虽然名义上是 1B 模型，真正适配到任务的有效自由度可能并不大。
+
+---
+
+# 五、为什么小 Transformer 也未明显领先
+
+## 1. 它必须从头学习 code 语义
+
+小 Transformer 不仅要学习预测任务，还要从监督标签中同时学会：
+
+- 哪些 ICD codes 相近；
+- procedure 和 diagnosis 如何关联；
+- 药物与疾病的对应关系；
+- 时间间隔的含义；
+- event type 的差异。
+
+单一的再入院标签提供的监督信息可能不足以学好所有这些表示。
+
+## 2. 输入粒度可能不正确
+
+如果输入是逐个 claim line 的长序列，模型可能在过细的层级上建模。
+
+更合理的层级通常是：
+
+```text
+claim lines/codes
+        ↓
+visit-level representation
+        ↓
+chronological visit sequence
+        ↓
+patient representation
+```
+
+先在 visit 内做无序 pooling，再在 visit 之间建模时间，通常比把所有 codes 直接放进一个 Transformer 更符合 claims 结构。
+
+## 3. 序列长度和截断可能丢失重要信息
+
+如果历史很长：
+
+- 保留最近事件可能丢失长期疾病负担；
+- 均匀截断可能丢失关键住院；
+- 保留所有事件又会导致计算量过高。
+
+Mean pool 可以低成本使用整个历史，反而拥有信息覆盖优势。
+
+---
+
+# 六、首先需要审计的公平性和泄漏问题
+
+## 1. 三个模型是否获得完全相同的 11 个变量
+
+这是最重要的问题之一。
+
+如果：
+
+- mean pool 使用 codes + 11 个变量；
+- Gemma 和 Transformer 只使用 codes；
+
+那么当前实验不能证明 mean pooling 架构更好，只能证明这 11 个变量非常有价值。
+
+公平比较应该同时报告：
+
+1. 11 个变量；
+2. codes；
+3. 11 个变量 + codes；
+
+并确保每种架构都能使用相同的 11 个变量。
+
+## 2. “最近住院天数”的时间定义
+
+必须明确它是：
+
+- 距预测时点之前最近一次住院的天数；
+
+而不是：
+
+- 使用了目标窗口中的住院；
+- 使用了事后才完成的 claim；
+- 使用了预测时点之后才能获得的信息。
+
+如果模型部署在出院时，还要确认哪些 diagnosis、procedure 和 discharge 信息在真实出院时已经可用，而不是几周后 claim adjudication 才可用。
+
+## 3. Patient-level split
+
+同一患者的不同 episodes 不应同时出现在训练集和测试集，否则模型可能利用稳定的患者模式或重复历史。
+
+推荐至少使用：
+
+- patient-level split；
+- temporal split；
+- 最好再做未来时间段的完全 out-of-time test。
+
+## 4. Claim maturity
+
+预测窗口和 feature window 都应留出足够 claim maturity，避免近期 claims 因提交延迟而不完整。
+
+---
+
+# 七、建议的诊断实验矩阵
+
+## 第一组：信息来源消融
+
+| 模型 | Codes | 11 个变量 | 目的 |
+|---|---:|---:|---|
+| Logistic/MLP | 否 | 是 | 测量汇总变量的独立贡献 |
+| Mean pool | 是 | 否 | 测量 code 组成的贡献 |
+| Mean pool | 是 | 是 | 当前强基线 |
+| Transformer | 是 | 否 | 与 codes-only mean pool 比较 |
+| Transformer | 是 | 是 | 最公平的完整比较 |
+| Gemma | 是 | 否 | 测量语言模型本身 |
+| Gemma | 是 | 是 | 与完整 mean pool 公平比较 |
+
+如果“11 个变量”单独已经非常接近完整模型，那么研究重点应转向 tabular 风险因素，而不是更大的 sequence model。
+
+## 第二组：验证序列信息是否真实存在
+
+对同一个 Transformer 依次测试：
+
+1. 原始时间顺序；
+2. 同一 visit 内打乱 codes；
+3. visits 之间打乱顺序；
+4. 删除日期和 time-gap；
+5. 只保留 event type；
+6. 只保留最近 30、90、180、365 天；
+7. 使用全历史。
+
+解释方式：
+
+- visit 内打乱没有下降：visit 内应使用 pooling；
+- visits 之间打乱没有下降：长期顺序价值很小；
+- 删除 time-gap 明显下降：需要 time-aware 模型；
+- 只保留最近 90 天几乎不下降：长期 Transformer 没必要；
+- 全历史明显优于近期窗口：mean pooling 的历史覆盖可能是优势来源。
+
+## 第三组：Learning curve
+
+固定同一个验证集和测试集，在以下训练量上比较：
+
+- 2%；
+- 5%；
+- 10%；
+- 20%；
+- 50%；
+- 100%。
+
+重点不是只看绝对分数，而是看斜率：
+
+- mean pool 是否在 20% 后趋于饱和；
+- Transformer 是否仍在稳定提升；
+- 两者差距是否随数据增加而扩大；
+- Gemma 是否受数据量影响较小。
+
+如果 Transformer 到 50%–100% 仍没有拉开差距，则继续投入的理由很弱。
+
+## 第四组：统计与业务指标
+
+至少报告：
+
+- AUROC；
+- AUPRC；
+- Brier score；
+- calibration intercept/slope；
+- reliability plot；
+- top 5% 和 top 10% 风险人群中的 recall/precision；
+- 固定 sensitivity 下的 specificity；
+- 多随机种子均值和标准差；
+- paired bootstrap 置信区间；
+- 训练时间、推理延迟和显存。
+
+“统计显著”不一定代表“业务值得”。建议预先规定最低有价值提升，例如：
+
+- AUROC 提升 0.005–0.01；
+- AUPRC 相对提升 2%–5%；
+- 或固定干预容量下显著找出更多再入院患者。
+
+阈值应根据业务成本最终确定。
+
+---
+
+# 八、强化 mean pool 的推荐架构
+
+在切换到大模型前，更值得先尝试一个低成本升级版。
+
+## 1. 按 event type 分开 pooling
+
+分别建立：
+
+- diagnosis pool；
+- procedure pool；
+- medication pool；
+- inpatient/outpatient pool；
+- place-of-service pool。
+
+然后拼接，而不是把所有 codes 放进同一个均值。
+
+## 2. 同时使用多种 pooling
+
+每一类事件计算：
+
+- mean；
+- sum；
+- max；
+- log-count；
+- unique-count。
+
+Mean 表示组成，sum/count 表示强度，max 捕捉单个高风险事件。
+
+## 3. 时间衰减 pooling
+
+例如：
+
+\[
+z=\frac{\sum_i \exp(-\lambda \Delta t_i)e(c_i)}
+{\sum_i \exp(-\lambda \Delta t_i)}
+\]
+
+也可以直接按窗口建立多个 pools：
+
+- 0–30 天；
+- 31–90 天；
+- 91–180 天；
+- 181–365 天；
+- 365 天以上。
+
+这种做法保留了大部分近期性信息，但比 Transformer 快很多。
+
+## 4. Visit-level 分层模型
+
+推荐结构：
+
+```text
+同一次 visit 的 codes
+        ↓
+type-specific mean/max pooling
+        ↓
+visit embedding + time gap
+        ↓
+最近 K 次 visit 的小型 Transformer/GRU
+        ↓
+与长期 pooled history + 11 个变量拼接
+        ↓
+classification head
+```
+
+这样只在 visits 之间使用序列模型，而不对每个 claim line 使用 attention。
+
+## 5. DeepSets
+
+DeepSets 可以表示为：
+
+\[
+z=\rho\left(\sum_i\phi(e(c_i), type_i, time_i)\right)
+\]
+
+它比简单均值更有表达能力，同时仍然具有排列不变性和较低计算成本。它可能是你当前最值得尝试的下一步。
+
+## 6. Residual sequence model
+
+可以让 sequence model 只学习 mean-pool 基线无法解释的部分：
+
+\[
+\text{logit}(p)
+=
+\text{logit}(p_{\text{pool}})
++
+\delta_{\text{sequence}}
+\]
+
+或者使用 out-of-fold baseline prediction 作为 sequence model 的输入。
+
+这样可以直接回答：
+
+> 序列模型到底增加了多少独立信息？
+
+---
+
+# 九、对原模型候选清单的重新排序
+
+## Tier 0：现在应该优先做
+
+### 1. 强化版 mean pooling / DeepSets
+
+当前最有可能成为生产模型的路线。
+
+理由：
+
+- 已被内部实验支持；
+- 训练和推理成本最低；
+- 易于使用全历史；
+- 易于解释和校准；
+- 可以快速进行大量消融和超参数搜索。
+
+### 2. LightGBM/CatBoost/稀疏线性模型
+
+输入可以包括：
+
+- 11 个变量；
+- code counts；
+- 时间窗口 counts；
+- top codes；
+- risk-group counts；
+- pooled embeddings。
+
+它们不仅是 baseline，也可能成为最终模型或 ensemble 成员。
+
+### 3. Visit-level 小型时序模型
+
+仅在实验确认 visits 顺序有增量价值后使用。
+
+---
+
+## Tier 1：最值得保留的预训练 challenger
+
+### ReClaim-L / ReClaim-M
+
+仍是理论最佳预训练候选，因为它们不是一般医疗语言模型，而是 claims-native foundation model。
+
+但新的判断是：
+
+> ReClaim 是最值得挑战 mean pool 的候选，而不是无需实验就应取代 mean pool 的候选。
+
+如果能获得权重：
+
+- ReClaim-L：理论上限测试；
+- ReClaim-M：可能更适合单张 T4；
+- 使用原生 tokenizer；
+- 与同样包含 11 个变量的 mean-pool baseline 比较；
+- 同时衡量 uplift 与计算成本。
+
+### BioClinical ModernBERT-Large
+
+仍然是开放权重模型中最合理的 encoder challenger，但优先级应低于强化 mean pool。
+
+只有在采用 `code + description` 序列化后，它的医疗语言预训练才有机会发挥价值。
+
+推荐角色：
+
+- 不作为默认生产主模型；
+- 作为“临床语义是否增加信息”的对照；
+- 使用 partial fine-tuning 或 LoRA；
+- 将 11 个变量拼接到 patient representation 后再分类。
+
+### HealthHistory OpenLLaMA-7B
+
+适合回答：
+
+> Insurance-domain adaptation 是否比更现代的通用医疗模型更重要？
+
+但它的 backbone、数据规模、国家和编码体系存在局限，所以属于研究性 challenger。
+
+---
+
+## Tier 2：选择性实验
+
+### ClinicalT5-Large
+
+有再入院应用先例，但：
+
+- seq2seq 架构较重；
+- 主要是临床文本预训练；
+- 未必优于 encoder 或 set model。
+
+只有在 BioClinical ModernBERT 显示 code description 确实有效后，才值得继续。
+
+### Meerkat-8B / BioMistral-7B / Gemma
+
+新的内部证据明显降低了它们的优先级。
+
+它们可以测试“大模型医学语义”的上限，但不应成为第一轮主模型。除非：
+
+- code description 输入带来明确提升；
+- learning curve 显示大型模型仍在增长；
+- operational metrics 有实际改善。
+
+否则 7B–8B QLoRA 的成本不合理。
+
+---
+
+## Tier 3：条件性架构候选
+
+### CEHR-BERT、DT-BEHRT、MOTOR
+
+只有在以下实验成立时才值得投入：
+
+- visits 打乱导致明显下降；
+- time-gap 删除导致明显下降；
+- 近期窗口无法覆盖全部信号。
+
+如果顺序和时间没有增量价值，它们的主要优势就无法发挥。
+
+### Med-BERT
+
+保留为经典 structured medical baseline，但规模和建模能力有限。
+
+### CURE、Claimsformer、GERBEHRT、Claim-PT、TMAE
+
+更适合参考：
+
+- tokenizer；
+- event vocabulary；
+- claims preprocessing；
+- time encoding；
+- pretraining objective。
+
+由于模型小或缺少可用 checkpoint，不应优先消耗当前 T4 资源。
+
+### NEST、ORA、HICD
+
+保留为后期研究方向。在 mean pool 尚未被充分优化前，不建议从头复现。
+
+---
+
+# 十、修订后的实施路线
+
+## 阶段一：验证当前发现
+
+目标：判断优势来自架构、汇总变量还是数据问题。
+
+完成：
+
+- feature parity；
+- patient-level/time split；
+- 泄漏审计；
+- summary-only、codes-only 和 combined ablation；
+- paired bootstrap；
+- 多随机种子；
+- 20%–100% learning curve。
+
+## 阶段二：建立强廉价模型
+
+依次尝试：
+
+1. 当前 mean pool；
+2. type-specific pooling；
+3. mean + sum + max；
+4. 时间窗口 pooling；
+5. time-decay pooling；
+6. DeepSets；
+7. 与 LightGBM/CatBoost ensemble。
+
+这一阶段很可能已经得到足够好的生产候选。
+
+## 阶段三：检验真正的序列价值
+
+尝试：
+
+- visit-level pooling；
+- 最近 K 次 visits 的小型 Transformer；
+- pooled long-term history + recent visit sequence；
+- residual sequence model。
+
+不要再直接对所有 claim lines 使用大型 Transformer。
+
+## 阶段四：预训练模型挑战赛
+
+优先顺序：
+
+1. ReClaim-M/L——如果能获得；
+2. BioClinical ModernBERT-Large；
+3. HealthHistory OpenLLaMA-7B；
+4. ClinicalT5-Large；
+5. Meerkat-8B。
+
+所有模型必须：
+
+- 使用同样的预测时点；
+- 使用同样的 feature window；
+- 获得同样的 11 个变量；
+- 在同一个测试集上比较；
+- 报告计算成本和业务指标。
+
+## 阶段五：只有证明有效后再做 continued pretraining
+
+只有当预训练模型已经直接微调胜过强 mean pool，才值得在内部 claims 上进行 continued pretraining。
+
+否则，continued pretraining 很可能只是把大量算力用于学习 mean pool 已经捕捉到的统计规律。
+
+---
+
+# 十一、最终结论
+
+你的结果不是反常现象，而是一个非常合理、非常重要的经验信号。
+
+当前最可信的解释是：
+
+> 30 天再入院风险的大部分信息来自患者疾病和服务组成、近期利用率及少量强汇总特征；这些信息天然适合用集合聚合模型表达。复杂 Transformer 可以利用的额外时序信息可能有限、稀疏或被 claims 噪声破坏。
+
+因此，修订后的最终推荐是：
+
+### 当前生产主路线
+
+> Type-specific、time-aware mean pooling/DeepSets + 11 个汇总变量 + 校准。
+
+必要时与 LightGBM/CatBoost 做 ensemble。
+
+### 最优低成本升级
+
+> Visit 内 pooling + visits 之间的小型时序模型，而不是对全部 claim codes 使用大 Transformer。
+
+### 最值得挑战该基线的 foundation model
+
+> ReClaim-M/L，如果能够取得 checkpoint 和 tokenizer。
+
+### 最合理的开放权重 challenger
+
+> BioClinical ModernBERT-Large，但应作为增量实验，而不是默认优胜者。
+
+### 当前应降低优先级的路线
+
+> Gemma、Meerkat、BioMistral 等通用或医疗文本 LLM，以及从头训练的大量复杂 Transformer。
+
+最后，模型选择标准应从：
+
+> 哪个模型参数最多？
+
+正式改为：
+
+> 在严格公平的输入和测试条件下，哪个模型能以可接受的计算成本，提供 mean pool + 汇总变量之外稳定、可复现、具有业务意义的增量预测价值？
