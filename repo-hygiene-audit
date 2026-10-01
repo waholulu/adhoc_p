@@ -10,7 +10,8 @@ disable-model-invocation: true
 
 ## 1. 读取上下文
 
-先阅读已有的 CLAUDE.md、PROJECT_MAP.md 和运行清单。
+先阅读 CLAUDE.md 和运行清单。如果项目里另有索引文件（如 PROJECT_MAP.md），一并阅读；
+没有就跳过，不要因为缺少索引文件而报错或建议新建一个。
 运行清单按以下顺序识别，找到即停：
 1. `runs/manifest.yaml` 或 `runs/manifest.json`
 2. CLAUDE.md / PROJECT_MAP.md 中声明的 pipeline 入口及其配置文件
@@ -50,6 +51,9 @@ disable-model-invocation: true
 疑似被外部使用的文件一律归入"证据不足，必须保留"，并说明原因。
 检查范围不完整时，明确标记不确定，不能声称文件无用。
 
+索引覆盖检查：仅当项目中存在索引文件时执行，列出索引从未提到的文件和目录。
+没有索引文件时跳过这一步，并在"仍有的风险"中注明"未做索引覆盖检查"。
+
 ## 5. 分类
 
 - 当前有效文件
@@ -68,7 +72,8 @@ disable-model-invocation: true
 3. **仍有的风险**：未覆盖的检查范围、无法验证的外部依赖
 4. **建议归档位置**：统一使用 `archive/YYYY-MM/<原相对路径>`，保留原目录结构
 5. **配置修改建议**，分开写：
-   - `PROJECT_MAP.md` 的修改
+   - CLAUDE.md 中项目结构说明的修改：只建议加入最少量的必要信息（入口、当前有效目录、归档目录），
+     不要让 CLAUDE.md 变长；项目已有索引文件时，修改建议写到索引文件里
    - `.gitignore` 的修改（管理 Git 跟踪）
    - Claude Code `permissions.deny` 中 Read 规则的修改（减少上下文噪声）
 
